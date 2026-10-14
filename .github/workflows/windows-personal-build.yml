@@ -1,33 +1,88 @@
 name: Windows build (personal fork)
 
-# Builds an unsigned Windows x64 installer on GitHub-hosted runners, so this fork
-# can produce its own copy without the upstream Blacksmith runners. Download the
-# result from the run's "Artifacts" section.
+# Builds an unsigned Windows x64 installer of an official OpenNOW release with
+# only the in-stream "Session" controller hint removed. Start it from the
+# Actions tab with "Run workflow"; leave the version empty to build the newest
+# official nightly. Download the result from the run's "Artifacts" section.
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Official OpenNOW tag to build, for example v1.0.3-nightly.990.1 (empty = newest nightly)
+        type: string
+        default: ""
   push:
     branches:
       - main
-      - "claude/**"
+    paths:
+      - .github/workflows/windows-personal-build.yml
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-personal-build-${{ github.ref }}
+  group: windows-personal-build
   cancel-in-progress: true
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Choose the official version
+        id: tag
+        shell: bash
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          tag="$REQUESTED"
+          if [[ -z "$tag" ]]; then
+            tag=$(git ls-remote --tags --refs https://github.com/OpenCloudGaming/OpenNOW 'v*-nightly.*' \
+              | sed 's#.*refs/tags/##' | sort -V | tail -n 1)
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(nightly|supporter)\.[1-9][0-9]*\.[1-9][0-9]*)?$ ]]; then
+            echo "Unexpected OpenNOW tag: '$tag'"
+            exit 1
+          fi
+          echo "Building OpenNOW $tag without the Session hint"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
   windows-x64:
+    needs: resolve
     runs-on: windows-2025
     timeout-minutes: 360
     env:
       CARGO_TERM_COLOR: always
       SDL_VERSION: release-3.2.20
+      OPENNOW_BUILD_VERSION: ${{ needs.resolve.outputs.version }}
     steps:
-      - name: Checkout
+      - name: Checkout official OpenNOW ${{ needs.resolve.outputs.tag }}
         uses: actions/checkout@v4
+        with:
+          repository: OpenCloudGaming/OpenNOW
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+
+      - name: Remove the in-stream Session hint
+        shell: python
+        run: |
+          import pathlib
+          import sys
+
+          path = pathlib.Path("opennow-qt/qml/screens/StreamScreen.qml")
+          text = path.read_text(encoding="utf-8")
+          hint = '            SessionGlyphs.Hint { objectName: "streamSessionHint"; prompts: glyphs; button: "GUIDE"; label: qsTr("Session") }\n'
+          panel = '        visible: root.videoReady && AppController.overlay === ""\n'
+          if text.count(hint) != 1 or text.count(panel) != 1:
+              sys.exit("StreamScreen.qml changed upstream; the Session hint patch needs updating.")
+          text = text.replace(hint, "")
+          # Hide the pill entirely when no hint is left to show (controller input).
+          text = text.replace(panel, panel[:-1] + " && streamHints.implicitWidth > 0\n")
+          path.write_text(text, encoding="utf-8")
+          print("Removed the in-stream Session hint.")
 
       - name: Enable Windows Media Foundation
         shell: pwsh
@@ -110,6 +165,7 @@ jobs:
             -G "Ninja Multi-Config" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DOPENNOW_BUILD_VERSION="$OPENNOW_BUILD_VERSION" \
             -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/SDL-install"
 
       - name: Build Qt release
@@ -136,13 +192,12 @@ jobs:
           if (Test-Path $payload) { Remove-Item $payload -Recurse -Force }
           Expand-Archive $zip[0].FullName $payload
           $setup = Join-Path (Resolve-Path build/qt-packages) ([IO.Path]::GetFileNameWithoutExtension($zip[0].Name) + "-setup.exe")
-          $version = (Select-String -Path opennow-qt/CMakeLists.txt -Pattern 'project\(OpenNOWQt VERSION ([0-9.]+)').Matches[0].Groups[1].Value
-          ./opennow-qt/packaging/windows/build-setup.ps1 -Payload $payload -Version $version -Arch x64 -OutputFile $setup
+          ./opennow-qt/packaging/windows/build-setup.ps1 -Payload $payload -Version $env:OPENNOW_BUILD_VERSION -Arch x64 -OutputFile $setup
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: OpenNOW-Windows-x64
+          name: OpenNOW-${{ needs.resolve.outputs.version }}-Windows-x64-no-session-hint
           path: |
             build/qt-packages/*.zip
             build/qt-packages/*-setup.exe
